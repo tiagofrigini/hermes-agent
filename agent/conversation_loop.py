@@ -6236,6 +6236,20 @@ def run_conversation(
                                 pass
                     break
 
+                # A successful reassign of this process's own active card is
+                # the terminal action for the old orchestrator. The trusted
+                # tool result carries the DB-classified self_handoff bit, so
+                # stop now rather than spend another model turn narrating or
+                # trying to mutate the card after ownership has moved.
+                from agent.kanban_stop import (
+                    session_completed_kanban_self_handoff,
+                )
+
+                if session_completed_kanban_self_handoff(messages):
+                    _turn_exit_reason = "kanban_self_handoff"
+                    final_response = ""
+                    break
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    session_completed_kanban_self_handoff,
 )
 
 
@@ -74,8 +77,67 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def _self_handoff_messages(*, task_id: str = "t_self", result: dict | None = None):
+    payload = {
+        "ok": True,
+        "task_id": task_id,
+        "self_handoff": True,
+    }
+    if result is not None:
+        payload = result
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "handoff-1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_reassign",
+                        "arguments": json.dumps({
+                            "task_id": task_id,
+                            "profile": "worker-code",
+                            "reclaim": True,
+                        }),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_reassign",
+            "tool_call_id": "handoff-1",
+            "content": json.dumps(payload),
+        },
+    ]
 
 
+def test_successful_current_task_self_handoff_is_terminal(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_self")
+    messages = _self_handoff_messages()
+
+    assert session_completed_kanban_self_handoff(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize(
+    "task_id,result",
+    [
+        ("t_other", None),
+        ("t_self", {"ok": False, "task_id": "t_self", "self_handoff": True}),
+        ("t_self", {"ok": True, "task_id": "t_self", "self_handoff": False}),
+        ("t_self", {"ok": True, "task_id": "t_other", "self_handoff": True}),
+    ],
+)
+def test_failed_or_mismatched_reassign_is_not_terminal(
+    clear_kanban_env, task_id, result,
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_self")
+    messages = _self_handoff_messages(task_id=task_id, result=result)
+
+    assert session_completed_kanban_self_handoff(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────

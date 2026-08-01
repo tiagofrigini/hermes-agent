@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -47,8 +48,51 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def session_completed_kanban_self_handoff(
+    messages: Iterable[dict] | None,
+    *,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Return whether the current turn successfully handed off its own card.
+
+    ``kanban_reassign`` is terminal only when the trusted tool result confirms
+    both a successful mutation and DB-classified ``self_handoff`` for the
+    current dispatcher task. Merely calling the tool, a failed call, or
+    reassigning another card must not terminate the model loop.
+    """
+    current_task = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not current_task or not messages:
+        return False
+
+    for msg in reversed(list(messages)):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "user":
+            break
+        if role != "tool" or str(msg.get("name") or "") != "kanban_reassign":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(content, dict):
+            continue
+        if (
+            content.get("ok") is True
+            and content.get("self_handoff") is True
+            and content.get("task_id") == current_task
+        ):
+            return True
+    return False
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True if this turn invoked a terminal kanban transition."""
+    if session_completed_kanban_self_handoff(messages):
+        return True
     if not messages:
         return False
     for msg in messages:
@@ -105,4 +149,5 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
+    "session_completed_kanban_self_handoff",
 ]
