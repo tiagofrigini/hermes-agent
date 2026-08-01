@@ -1270,6 +1270,146 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
 
 
+def test_reassign_task_nonself_reclaim_terminates_previous_worker(
+    kanban_home, monkeypatch,
+):
+    """A non-self handoff must retain the normal previous-worker termination."""
+    import json as _json
+    import secrets
+    import time
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="handoff", assignee="router")
+        lock = secrets.token_hex(8)
+        old_pid = 424242
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            (lock, future, old_pid, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock, future, old_pid, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id),
+        )
+        conn.commit()
+
+        terminated = []
+
+        def fake_terminate(pid, previous_lock, *, signal_fn=None):
+            terminated.append((pid, previous_lock))
+            return {
+                "prev_pid": pid,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+            }
+
+        monkeypatch.setattr(_kb, "_terminate_reclaimed_worker", fake_terminate)
+
+        assert kb.reassign_task(
+            conn, task_id, "worker-review", reclaim_first=True,
+        ) is True
+        assert terminated == [(old_pid, lock)]
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee == "worker-review"
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+
+        old_run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE id=?", (run_id,),
+        ).fetchone()
+        assert old_run is not None
+        assert old_run["status"] == "reclaimed"
+        assert old_run["outcome"] == "reclaimed"
+
+        reclaimed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed'",
+            (task_id,),
+        ).fetchone()
+        assert reclaimed is not None
+        payload = _json.loads(reclaimed["payload"])
+        assert payload["termination_attempted"] is True
+        assert payload["terminated"] is True
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("operation", ["reclaim", "reassign"])
+def test_same_pid_on_remote_claim_is_not_self_handoff(
+    kanban_home, monkeypatch, operation
+):
+    """PID equality alone must not suppress handling of a remote worker."""
+    import json as _json
+    import os
+    import time
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="remote pid collision", assignee="router")
+        remote_lock = f"remote-host:{os.getpid()}"
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=? WHERE id=?",
+            (remote_lock, future, os.getpid(), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, remote_lock, future, os.getpid(), int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id),
+        )
+        conn.commit()
+
+        termination_calls = []
+
+        def fake_terminate(pid, previous_lock, *, signal_fn=None):
+            termination_calls.append((pid, previous_lock))
+            return {
+                "prev_pid": pid,
+                "host_local": False,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+            }
+
+        monkeypatch.setattr(_kb, "_terminate_reclaimed_worker", fake_terminate)
+
+        if operation == "reclaim":
+            assert kb.reclaim_task(conn, task_id) is True
+        else:
+            assert kb.reassign_task(
+                conn, task_id, "worker-code", reclaim_first=True,
+            ) is True
+
+        assert termination_calls == [(os.getpid(), remote_lock)]
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='reclaimed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert _json.loads(event["payload"]).get("self_handoff") is not True
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Unified failure counter — timeout + crash paths increment the same counter
 # as spawn failures, and the circuit breaker trips after N consecutive
