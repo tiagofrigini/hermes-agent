@@ -7299,6 +7299,7 @@ def decompose_triage_task(
             "title": "...",
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
+            "skills": ["skill-a", "skill-b"], # optional; omitted inherits root
             "parents": [0, 2],                 # indices into this same children list
         }
 
@@ -7319,6 +7320,7 @@ def decompose_triage_task(
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
+    child_skill_specs: list[tuple[bool, Optional[list[str]]]] = []
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             raise ValueError(f"child[{idx}] is not a dict")
@@ -7335,6 +7337,24 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        if "skills" not in child:
+            child_skill_specs.append((False, None))
+            continue
+        raw_skills = child["skills"]
+        if not isinstance(raw_skills, list):
+            raise ValueError(f"child[{idx}].skills must be a list")
+        normalized_skills: list[str] = []
+        seen_skills: set[str] = set()
+        for raw_name in raw_skills:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError(
+                    f"child[{idx}].skills must contain non-empty strings"
+                )
+            name = raw_name.strip()
+            if name not in seen_skills:
+                seen_skills.add(name)
+                normalized_skills.append(name)
+        child_skill_specs.append((True, normalized_skills))
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -7370,7 +7390,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, skills "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7385,6 +7405,16 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        try:
+            root_skills = (
+                json.loads(root_row["skills"])
+                if root_row["skills"] is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("root task has invalid skills metadata") from exc
+        if root_skills is not None and not isinstance(root_skills, list):
+            raise ValueError("root task has invalid skills metadata")
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7395,6 +7425,20 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            has_explicit_skills, explicit_skills = child_skill_specs[idx]
+            if has_explicit_skills:
+                assert explicit_skills is not None
+                missing_root_skills = [
+                    name for name in (root_skills or []) if name not in explicit_skills
+                ]
+                if missing_root_skills:
+                    raise ValueError(
+                        f"child[{idx}].skills must include root skill(s): "
+                        + ", ".join(missing_root_skills)
+                    )
+                child_skills = explicit_skills
+            else:
+                child_skills = root_skills
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -7419,8 +7463,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, skills, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7429,13 +7473,20 @@ def decompose_triage_task(
                     child_ws_kind,
                     child_ws_path,
                     tenant,
+                    json.dumps(child_skills) if child_skills is not None else None,
                     now,
                     (author or "decomposer"),
                 ),
             )
             _append_event(
-                conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                conn,
+                new_id,
+                "created",
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "skills": child_skills,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
