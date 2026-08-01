@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 import pytest
 
@@ -772,6 +773,105 @@ def multi_board_env(monkeypatch, tmp_path):
         "default_db": kb.kanban_db_path(),
         "alt_db": kb.kanban_db_path(board="alt"),
     }
+
+
+def test_task_scoped_cross_board_override_fails_before_db_connect(
+    multi_board_env, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    connect_mock = Mock(side_effect=AssertionError("must reject before DB connect"))
+    monkeypatch.setattr(kt, "_connect", connect_mock)
+
+    result = json.loads(
+        kt._handle_show(
+            {"task_id": multi_board_env["default_seed"], "board": "alt"}
+        )
+    )
+
+    assert "board" in result.get("error", "").lower()
+    assert connect_mock.call_count == 0
+
+
+def test_task_scoped_cross_board_attach_url_fails_before_network(
+    multi_board_env, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    download_mock = Mock(side_effect=AssertionError("must reject before download"))
+    monkeypatch.setattr(kt, "_download_url_with_cap", download_mock)
+
+    result = json.loads(
+        kt._handle_attach_url(
+            {
+                "task_id": multi_board_env["default_seed"],
+                "url": "https://example.com/file.txt",
+                "board": "alt",
+            }
+        )
+    )
+
+    assert "board" in result.get("error", "").lower()
+    assert download_mock.call_count == 0
+
+
+@pytest.mark.parametrize("env_board", [None, "", "   \t"])
+def test_task_scoped_explicit_board_requires_env_board(
+    multi_board_env, monkeypatch, env_board
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    if env_board is None:
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", env_board)
+    connect_mock = Mock(side_effect=AssertionError("must reject before DB connect"))
+    monkeypatch.setattr(kt, "_connect", connect_mock)
+
+    result = json.loads(
+        kt._handle_show(
+            {"task_id": multi_board_env["default_seed"], "board": "alt"}
+        )
+    )
+
+    assert "HERMES_KANBAN_BOARD" in result.get("error", "")
+    assert connect_mock.call_count == 0
+
+
+@pytest.mark.parametrize("board", ["default", "  Default  "])
+def test_task_scoped_matching_board_override_is_allowed(
+    multi_board_env, monkeypatch, board
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    result = json.loads(
+        kt._handle_show(
+            {"task_id": multi_board_env["default_seed"], "board": board}
+        )
+    )
+
+    assert result["task"]["id"] == multi_board_env["default_seed"]
+
+
+def test_non_task_explicit_board_override_still_routes(multi_board_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(
+        kt._handle_show(
+            {"task_id": multi_board_env["alt_seed"], "board": "alt"}
+        )
+    )
+
+    assert result["task"]["id"] == multi_board_env["alt_seed"]
+    assert result["task"]["title"] == "seed-alt"
 
 
 def test_board_param_none_falls_back_to_env(worker_env):
