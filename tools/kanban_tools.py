@@ -1670,8 +1670,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "spreadsheets, generated images), list their absolute paths "
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
-        "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "so the deliverable lands in their chat alongside the summary. "
+        "Files listed in ``metadata.changed_files`` are also retained "
+        "when they are readable files inside the managed scratch workspace; "
+        "outside, missing, or unreadable entries produce an advisory event "
+        "instead of weakening explicitly declared ``artifacts``."
     ),
     "parameters": {
         "type": "object",
