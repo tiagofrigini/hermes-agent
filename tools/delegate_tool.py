@@ -3531,7 +3531,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         from hermes_cli.runtime_provider import _detect_api_mode_for_url
 
         base_lower = configured_base_url.lower()
-        provider = "custom"
+        provider = configured_provider or "custom"
+        if _provider_lower in {"auto", "openrouter"}:
+            provider = "custom"
         api_mode = _detect_api_mode_for_url(configured_base_url) or "chat_completions"
         if (
             base_url_hostname(configured_base_url) == "chatgpt.com"

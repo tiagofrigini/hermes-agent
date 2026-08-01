@@ -621,6 +621,30 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "local-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
 
+    def test_direct_endpoint_builtin_provider_aliases_stay_custom(self):
+        parent = _make_mock_parent(depth=0)
+        for provider in ("auto", "Auto", "openrouter", "OPENROUTER"):
+            with self.subTest(provider=provider):
+                cfg = {
+                    "model": "qwen2.5-coder",
+                    "provider": provider,
+                    "base_url": "https://proxy.example/v1",
+                    "api_key": "proxy-key",
+                }
+                creds = _resolve_delegation_credentials(cfg, parent)
+                self.assertEqual(creds["provider"], "custom")
+
+    def test_direct_endpoint_preserves_explicit_named_provider(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "deepseek-v4-pro",
+            "provider": "opencode-go",
+            "base_url": "https://proxy.example/v1",
+            "api_key": "proxy-key",
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "opencode-go")
+
     def test_direct_endpoint_auto_detects_anthropic_messages_suffix(self):
         # Issue #10213: Azure AI Foundry exposes Anthropic-compatible models at
         # a /anthropic URL suffix. Subagents must pick anthropic_messages
