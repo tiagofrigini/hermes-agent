@@ -2865,6 +2865,26 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _claim_lock_is_host_local(claim_lock: Optional[str]) -> bool:
+    """Whether a ``host:pid`` claim lock belongs to this host."""
+    if not claim_lock:
+        return False
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    return str(claim_lock).startswith(host_prefix)
+
+
+def _is_current_process_claim(
+    worker_pid: Optional[int], claim_lock: Optional[str]
+) -> bool:
+    """Identify self-handoff only when both host and PID match."""
+    if not _claim_lock_is_host_local(claim_lock):
+        return False
+    try:
+        return bool(worker_pid and int(worker_pid) == os.getpid())
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -2876,6 +2896,31 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def validate_branch_name(value: str) -> str:
+    """Return a normalized Git branch name or raise ``ValueError``.
+
+    ``git check-ref-format --branch`` is the canonical validator for branch
+    refs.  It does not require a repository and keeps the CLI, structured
+    tool, and database ingress paths on the same rules.
+    """
+    branch = str(value).strip()
+    if not branch:
+        raise ValueError("branch name must not be empty")
+    try:
+        result = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"could not validate git branch name: {exc}") from exc
+    if result.returncode != 0:
+        raise ValueError(f"invalid git branch name: {branch!r}")
+    return branch
 
 
 def create_task(
@@ -2964,7 +3009,7 @@ def create_task(
             f"got {workspace_kind!r}"
         )
     if branch_name is not None:
-        branch_name = str(branch_name).strip() or None
+        branch_name = validate_branch_name(branch_name)
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
@@ -3519,6 +3564,36 @@ def set_reasoning_effort(
             conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
         )
         return True
+
+
+def _assert_fresh_admin_actor(
+    conn: sqlite3.Connection,
+    *,
+    actor_task_id: Optional[str] = None,
+    actor_run_id: Optional[int] = None,
+    actor_assignee: Optional[str] = None,
+) -> None:
+    """Validate task-scoped admin ownership inside the caller's write txn."""
+    if actor_task_id is None:
+        return
+    if actor_run_id is None or actor_assignee is None:
+        raise RuntimeError(
+            f"stale task-scoped orchestrator context for {actor_task_id}"
+        )
+    canonical_actor = _canonical_assignee(actor_assignee)
+    row = conn.execute(
+        "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
+        (actor_task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or row["current_run_id"] != int(actor_run_id)
+        or row["assignee"] != canonical_actor
+    ):
+        raise RuntimeError(
+            f"stale task-scoped orchestrator context for {actor_task_id}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4625,9 +4700,29 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
+    worker_pid = row["worker_pid"]
+    self_handoff = _is_current_process_claim(worker_pid, prev_lock)
+    if self_handoff:
+        # A task-scoped orchestrator may intentionally reassign its own
+        # canonical card in place. Signaling worker_pid here would terminate
+        # this process before the DB transition and tool response land,
+        # leaving the card owned by the orchestrator and producing a false
+        # clean-exit protocol violation. Release the claim atomically below;
+        # the current process will exit normally after returning the tool
+        # result, while the dispatcher can pick the ready card up under the
+        # new assignee.
+        termination = {
+            "prev_pid": int(worker_pid),
+            "host_local": True,
+            "termination_attempted": False,
+            "terminated": False,
+            "sigkill": False,
+            "self_handoff": True,
+        }
+    else:
+        termination = _terminate_reclaimed_worker(
+            worker_pid, prev_lock, signal_fn=signal_fn,
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -4673,28 +4768,97 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    actor_task_id: Optional[str] = None,
+    actor_run_id: Optional[int] = None,
+    actor_assignee: Optional[str] = None,
 ) -> bool:
-    """Reassign a task, optionally reclaiming a stuck running worker first.
+    """Atomically reassign a task, optionally reclaiming its active run.
 
-    This is the recovery path for "this profile's model is broken, try
-    a different one". If ``reclaim_first`` is True, any active claim is
-    released (via :func:`reclaim_task`) before the reassign happens;
-    otherwise the function refuses to reassign a currently-running task
-    and returns False (caller can retry with ``reclaim_first=True``).
-
-    Returns True if the reassign landed. ``profile`` may be ``None`` to
-    unassign entirely.
+    Reclaim and assignee change deliberately share one ``BEGIN IMMEDIATE``
+    transaction.  The dispatcher therefore cannot claim the temporary ready
+    state under the old assignee.  Optional actor fields couple task-scoped
+    orchestrator freshness to the same transaction as the mutation.
     """
-    if reclaim_first:
-        # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
-    # assign_task handles its own txn + the still-running guard.
-    try:
-        return assign_task(conn, task_id, profile)
-    except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
-        # needs to decide whether to retry with reclaim.
-        return False
+    profile = _canonical_assignee(profile)
+    with write_txn(conn):
+        _assert_fresh_admin_actor(
+            conn,
+            actor_task_id=actor_task_id,
+            actor_run_id=actor_run_id,
+            actor_assignee=actor_assignee,
+        )
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, assignee, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+
+        active = row["status"] == "running" or row["claim_lock"] is not None
+        if active and not reclaim_first:
+            return False
+
+        if active:
+            prev_lock = row["claim_lock"]
+            worker_pid = row["worker_pid"]
+            reclaim_reason = reason or "reassign"
+            self_handoff = _is_current_process_claim(worker_pid, prev_lock)
+            if self_handoff:
+                termination = {
+                    "prev_pid": int(worker_pid),
+                    "host_local": True,
+                    "termination_attempted": False,
+                    "terminated": False,
+                    "sigkill": False,
+                    "self_handoff": True,
+                }
+            else:
+                termination = _terminate_reclaimed_worker(worker_pid, prev_lock)
+
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', assignee = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ?",
+                (profile, task_id),
+            )
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                error=f"manual_reclaim: {reclaim_reason}",
+                metadata=termination,
+            )
+            payload = {
+                "manual": True,
+                "reason": reclaim_reason,
+                "prev_lock": prev_lock,
+            }
+            payload.update(termination)
+            _append_event(
+                conn,
+                task_id,
+                "reclaimed",
+                payload,
+                run_id=run_id,
+            )
+        else:
+            if row["assignee"] != profile:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL WHERE id = ?",
+                    (profile, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ?",
+                    (profile, task_id),
+                )
+
+        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        return True
 
 
 def _verify_created_cards(
@@ -6288,12 +6452,27 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_running: bool = True,
+    actor_task_id: Optional[str] = None,
+    actor_run_id: Optional[int] = None,
+    actor_assignee: Optional[str] = None,
+) -> bool:
     with write_txn(conn):
+        _assert_fresh_admin_actor(
+            conn,
+            actor_task_id=actor_task_id,
+            actor_run_id=actor_run_id,
+            actor_assignee=actor_assignee,
+        )
+        running_clause = "" if allow_running else " AND status != 'running'"
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status != 'archived'" + running_clause,
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -7033,8 +7212,7 @@ def _terminate_reclaimed_worker(
     if not pid or pid <= 0 or not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    if not _claim_lock_is_host_local(claim_lock):
         return info
     info["host_local"] = True
 
@@ -9623,6 +9801,9 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    actor_task_id: Optional[str] = None,
+    actor_run_id: Optional[int] = None,
+    actor_assignee: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -9639,6 +9820,12 @@ def add_notify_sub(
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     with write_txn(conn):
+        _assert_fresh_admin_actor(
+            conn,
+            actor_task_id=actor_task_id,
+            actor_run_id=actor_run_id,
+            actor_assignee=actor_assignee,
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
