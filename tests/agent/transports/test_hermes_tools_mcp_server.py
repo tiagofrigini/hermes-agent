@@ -110,6 +110,31 @@ class TestModuleSurface:
 
 
 
+    def test_kanban_orchestrator_tools_exposed(self):
+        """Orchestrator agents need to dispatch new tasks, query the
+        board, and unblock/link tasks. Exposed so an orchestrator on
+        codex_app_server can do its job."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        for orch_tool in (
+            "kanban_create",
+            "kanban_show",
+            "kanban_list",
+            "kanban_unblock",
+            "kanban_link",
+            "kanban_reassign",
+        ):
+            assert orch_tool in EXPOSED_TOOLS, (
+                f"{orch_tool!r} missing from codex callback"
+            )
+
+    def test_expensive_admin_tools_not_exposed(self):
+        """Bulk archive and notification routing remain outside the
+        stateless Codex callback. Only reassign is required for orchestrator
+        self-handoff; do not widen the MCP surface by parity."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+
+        for admin_tool in ("kanban_archive", "kanban_notify_subscribe"):
+            assert admin_tool not in EXPOSED_TOOLS
 
 
 class TestMain:
