@@ -458,6 +458,7 @@ def test_reassign_current_running_card_hands_off_without_signaling_self(
     assert result["ok"] is True
     assert result["assignee"] == "worker-code"
     assert result["status"] == "ready"
+    assert result["self_handoff"] is True
     assert termination_calls == []
     with kb.connect() as conn:
         task = kb.get_task(conn, ready_task)

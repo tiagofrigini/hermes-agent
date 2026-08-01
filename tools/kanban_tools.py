@@ -1804,6 +1804,11 @@ def _handle_reassign(args: dict, **kw) -> str:
             before = kb.get_task(conn, task_id)
             if before is None:
                 return tool_error(f"task {task_id} not found")
+            before_run = (
+                kb.latest_run(conn, task_id)
+                if before.status == "running"
+                else None
+            )
             if before.assignee == profile and before.status != "running":
                 return _ok(
                     task_id=task_id,
@@ -1811,6 +1816,7 @@ def _handle_reassign(args: dict, **kw) -> str:
                     status=before.status,
                     assignee_changed=False,
                     reclaim_requested=reclaim,
+                    self_handoff=False,
                 )
             try:
                 changed = kb.reassign_task(
@@ -1827,12 +1833,24 @@ def _handle_reassign(args: dict, **kw) -> str:
             after = kb.get_task(conn, task_id)
             if after is None:
                 return tool_error(f"task {task_id} disappeared during reassign")
+            closed_run = (
+                kb.get_run(conn, before_run.id)
+                if before_run is not None
+                else None
+            )
+            self_handoff = bool(
+                closed_run is not None
+                and closed_run.outcome == "reclaimed"
+                and closed_run.metadata
+                and closed_run.metadata.get("self_handoff") is True
+            )
             return _ok(
                 task_id=task_id,
                 assignee=after.assignee,
                 status=after.status,
                 assignee_changed=before.assignee != after.assignee,
                 reclaim_requested=reclaim,
+                self_handoff=self_handoff,
             )
         finally:
             conn.close()

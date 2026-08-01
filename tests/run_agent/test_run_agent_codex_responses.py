@@ -1434,8 +1434,67 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
     assert function_output["call_id"] == "call_1"
 
 
+def test_run_conversation_self_handoff_stops_before_second_model_call(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_self")
+    agent = _build_agent(monkeypatch)
+    agent.tools.append({
+        "type": "function",
+        "function": {
+            "name": "kanban_reassign",
+            "description": "Reassign a kanban card.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    })
+    agent.valid_tool_names.add("kanban_reassign")
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_handoff",
+                call_id="call_handoff",
+                name="kanban_reassign",
+                arguments=(
+                    '{"task_id":"t_self","profile":"worker-code",'
+                    '"reclaim":true}'
+                ),
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16),
+        status="completed",
+        model="gpt-5-codex",
+    )
+    requests = []
+    responses = [response, _codex_message_response("unexpected second turn")]
 
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
 
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, *_args,
+    ):
+        call = assistant_message.tool_calls[0]
+        messages.append({
+            "role": "tool",
+            "name": "kanban_reassign",
+            "tool_call_id": call.id,
+            "content": (
+                '{"ok":true,"task_id":"t_self",'
+                '"self_handoff":true}'
+            ),
+        })
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("hand off this card")
+
+    assert len(requests) == 1
+    assert result["completed"] is True
+    assert result["final_response"] == ""
 
 
 def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(monkeypatch):
