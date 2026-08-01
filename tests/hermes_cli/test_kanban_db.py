@@ -1583,3 +1583,224 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Scratch retention hardening
+# ---------------------------------------------------------------------------
+#
+# A scratch task that declares its work via metadata["changed_files"]
+# must have those files preserved if they live under the managed scratch
+# root. If they cannot be preserved (missing / outside scratch), the
+# completion must record the gap as an advisory event so downstream
+# reviewers / fan-ins can fail closed.
+
+
+def test_complete_task_auto_promotes_scratch_changed_files(kanban_home):
+    """changed_files paths under scratch are persisted like artifacts."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render chart via changed_files")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "report.md"
+        report.write_text("kept by auto-promotion", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"changed_files": ["report.md"]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        run = kb.latest_run(conn, t)
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    persisted = [Path(p) for p in completed.payload["artifacts"]]
+    assert len(persisted) == 1
+    assert persisted[0].parent == kb.task_attachments_dir(t)
+    assert persisted[0].read_text(encoding="utf-8") == "kept by auto-promotion"
+    assert run is not None
+    assert run.metadata["artifacts"] == [str(persisted[0])]
+
+
+def test_complete_task_advises_when_changed_files_path_missing(kanban_home):
+    """Missing changed_files are advisory and do not block completion."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="claim-and-vanish")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        # Note: report.md is NOT created on disk.
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"changed_files": ["report.md"]},
+        )
+
+        events = kb.list_events(conn, t)
+        advisory = [
+            e for e in events if e.kind == "scratch_unpreserved_deliverables"
+        ]
+        assert kb.get_task(conn, t).status == "done"
+        assert kb.list_attachments(conn, t) == []
+    assert not ws.exists(), "successful completion still cleans scratch"
+    assert len(advisory) == 1
+    assert advisory[0].payload == {
+        "unpreserved": ["report.md"],
+        "reason": "missing_or_unreadable_in_scratch_workspace",
+    }
+
+
+def test_complete_task_emits_advisory_for_changed_files_outside_scratch(
+    kanban_home, tmp_path,
+):
+    """A changed_files path outside scratch is recorded as unpreservable."""
+    external = tmp_path / "external.md"
+    external.write_text("external deliverable", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="claim external deliverable")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"changed_files": [str(external)]},
+        )
+
+        events = kb.list_events(conn, t)
+        advisory = [
+            e for e in events
+            if e.kind == "scratch_unpreserved_deliverables"
+        ]
+        completed = [e for e in events if e.kind == "completed"][-1]
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert external.exists(), "external file untouched"
+    assert len(advisory) == 1, "expected exactly one advisory event"
+    payload = advisory[0].payload
+    assert payload["unpreserved"] == [str(external)]
+    assert payload["reason"] == "outside_managed_scratch_root"
+    # Completion still succeeded — purely advisory.
+    assert completed.payload.get("artifacts") in (None, [])
+
+
+def test_complete_task_keeps_valid_artifact_when_changed_file_is_missing(kanban_home):
+    """Advisory changed_files gaps cannot discard valid declared artifacts."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="keep the valid deliverable")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        valid = ws / "valid.md"
+        valid.write_text("durable", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={
+                "artifacts": [str(valid)],
+                "changed_files": ["missing.md"],
+            },
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        advisory = [
+            e
+            for e in kb.list_events(conn, t)
+            if e.kind == "scratch_unpreserved_deliverables"
+        ]
+
+    retained = [Path(path) for path in completed.payload["artifacts"]]
+    assert len(retained) == 1
+    assert retained[0].read_text(encoding="utf-8") == "durable"
+    assert advisory[0].payload["unpreserved"] == ["missing.md"]
+
+
+def test_complete_task_changed_files_duplicate_basenames_do_not_overwrite(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="keep both reports")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        first = ws / "a" / "report.md"
+        second = ws / "b" / "report.md"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"changed_files": ["a/report.md", "b/report.md"]},
+        )
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+
+    retained = [Path(path) for path in completed.payload["artifacts"]]
+    assert len(retained) == 2
+    assert len({path.name for path in retained}) == 2
+    assert {path.read_text(encoding="utf-8") for path in retained} == {
+        "first",
+        "second",
+    }
+
+
+def test_complete_task_changed_files_use_board_attachment_root(kanban_home):
+    kb.create_board("other", name="Other")
+    kb.init_db(board="other")
+
+    with kb.connect(board="other") as conn:
+        t = kb.create_task(conn, title="board-isolated report")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task, board="other")
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "report.md"
+        report.write_text("other board", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"changed_files": ["report.md"]},
+        )
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+
+    retained = Path(completed.payload["artifacts"][0])
+    assert retained.parent == kb.task_attachments_dir(t, board="other")
+    assert retained.parent != kb.task_attachments_dir(t, board=kb.DEFAULT_BOARD)
+
+
+def test_complete_task_missing_declared_artifact_remains_fail_closed(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="declared artifact is authoritative")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        missing = ws / "missing.md"
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(missing)]},
+            )
+
+        current = kb.get_task(conn, t)
+        assert current is not None
+        assert current.status == "ready"
+    assert ws.exists(), "failed completion keeps scratch available for retry"

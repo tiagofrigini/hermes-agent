@@ -5259,14 +5259,32 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
+def _collect_changed_file_paths(metadata: dict) -> list[str]:
+    """Return non-empty string entries from ``metadata.changed_files``."""
+    raw = metadata.get("changed_files") if isinstance(metadata, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+
+
 def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Retain declared artifacts and readable scratch ``changed_files``."""
     raw_artifacts = metadata.get("artifacts")
-    if not isinstance(raw_artifacts, (list, tuple)):
+    declared_artifacts = (
+        [
+            item.strip()
+            for item in raw_artifacts
+            if isinstance(item, str) and item.strip()
+        ]
+        if isinstance(raw_artifacts, (list, tuple))
+        else []
+    )
+    changed_files = _collect_changed_file_paths(metadata)
+    if not declared_artifacts and not changed_files:
         return
 
     row = conn.execute(
@@ -5286,6 +5304,43 @@ def _persist_scratch_completion_artifacts(
     except OSError:
         return
 
+    unpreserved: dict[str, list[str]] = {
+        "outside_managed_scratch_root": [],
+        "missing_or_unreadable_in_scratch_workspace": [],
+    }
+    declared_resolved: set[Path] = set()
+    for artifact in declared_artifacts:
+        try:
+            declared_resolved.add(Path(artifact).expanduser().resolve())
+        except OSError:
+            continue
+
+    promoted: list[tuple[str, str]] = []
+    promoted_resolved: set[Path] = set()
+    for declared in changed_files:
+        candidate = Path(declared).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                declared
+            )
+            continue
+        if not resolved.is_relative_to(workspace_root):
+            unpreserved["outside_managed_scratch_root"].append(declared)
+            continue
+        if not candidate.is_file():
+            unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                declared
+            )
+            continue
+        if resolved in declared_resolved or resolved in promoted_resolved:
+            continue
+        promoted.append((str(resolved), declared))
+        promoted_resolved.add(resolved)
+
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
@@ -5302,14 +5357,18 @@ def _persist_scratch_completion_artifacts(
         except OSError:
             pass
 
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
+    items = [(artifact, False, artifact) for artifact in declared_artifacts]
+    items.extend((artifact, True, original) for artifact, original in promoted)
+    for artifact, is_changed_file, original in items:
         src = Path(artifact).expanduser()
         try:
             resolved_src = src.resolve()
         except OSError:
+            if is_changed_file:
+                unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                    original
+                )
+                continue
             persisted.append(artifact)
             continue
 
@@ -5318,13 +5377,34 @@ def _persist_scratch_completion_artifacts(
             continue
 
         if not src.is_file():
+            if is_changed_file:
+                unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                    original
+                )
+                continue
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact is unavailable or not a regular file: {artifact}"
             )
 
-        size = resolved_src.stat().st_size
+        try:
+            size = resolved_src.stat().st_size
+        except OSError as exc:
+            if is_changed_file:
+                unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                    original
+                )
+                continue
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"could not inspect declared scratch artifact {artifact}: {exc}"
+            ) from exc
         if size > KANBAN_ATTACHMENT_MAX_BYTES:
+            if is_changed_file:
+                unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                    original
+                )
+                continue
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact exceeds the "
@@ -5334,8 +5414,12 @@ def _persist_scratch_completion_artifacts(
         dest: Optional[Path] = None
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+            dest = _unique_attachment_path(
+                attachment_dir, resolved_src.name, used_destinations
+            )
+            with resolved_src.open("rb") as source_file, dest.open(
+                "xb"
+            ) as destination_file:
                 copied = 0
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
@@ -5350,6 +5434,11 @@ def _persist_scratch_completion_artifacts(
                     dest.unlink(missing_ok=True)
                 except OSError:
                     pass
+            if is_changed_file:
+                unpreserved["missing_or_unreadable_in_scratch_workspace"].append(
+                    original
+                )
+                continue
             _discard_copies()
             if isinstance(exc, ArtifactPreservationError):
                 raise
@@ -5366,6 +5455,15 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+
+    for reason, paths in unpreserved.items():
+        if paths:
+            _append_event(
+                conn,
+                task_id,
+                "scratch_unpreserved_deliverables",
+                {"unpreserved": list(dict.fromkeys(paths)), "reason": reason},
+            )
 
 
 def _insert_completion_attachment(
