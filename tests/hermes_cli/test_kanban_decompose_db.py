@@ -21,13 +21,21 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
+def _create_triage(
+    conn,
+    title="rough idea",
+    body=None,
+    assignee=None,
+    tenant=None,
+    skills=None,
+):
     return kb.create_task(
         conn,
         title=title,
         body=body,
         assignee=assignee,
         tenant=tenant,
+        skills=skills,
         triage=True,
     )
 
@@ -88,5 +96,42 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_decompose_db_inherits_and_persists_root_skills(kanban_home):
+    with kb.connect_closing() as conn:
+        root_id = _create_triage(conn, skills=["root"])
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "Child", "parents": []}],
+        )
+
+        assert child_ids
+        child = kb.get_task(conn, child_ids[0])
+        assert child is not None
+        assert child.skills == ["root"]
+
+
+def test_decompose_db_rejects_root_skill_drop_atomically(kanban_home):
+    with kb.connect_closing() as conn:
+        root_id = _create_triage(conn, skills=["root"])
+
+        with pytest.raises(ValueError, match="must include root skill"):
+            kb.decompose_triage_task(
+                conn,
+                root_id,
+                root_assignee="orchestrator",
+                children=[
+                    {"title": "Child", "parents": [], "skills": ["extra"]}
+                ],
+            )
+
+        root = kb.get_task(conn, root_id)
+        assert root is not None
+        assert root.status == "triage"
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != ?", (root_id,)
+        ).fetchone()[0]
+        assert child_count == 0
 
 

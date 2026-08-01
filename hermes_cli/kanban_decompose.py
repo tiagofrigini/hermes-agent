@@ -70,6 +70,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "skills": ["required-skill", "optional-extra-skill"],
         "parents": [<int>, ...]
       },
       ...
@@ -89,6 +90,9 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - "skills" is optional. When omitted, inherit every skill required by the
+    root task. When provided, it MUST include every root skill and may add only
+    installed skill names. Never replace or weaken the root skill set.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -113,6 +117,8 @@ _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+
+Required root skills (every child inherits these): {root_skills}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -158,6 +164,64 @@ def _extract_json_blob(raw: str) -> Optional[dict]:
     if not isinstance(val, dict):
         return None
     return val
+
+
+def _is_installed_skill(name: str) -> bool:
+    """Return whether *name* resolves through the canonical skill registries."""
+    if ":" in name:
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            manager = get_plugin_manager()
+            manager.discover_and_load()
+            return manager.find_plugin_skill(name) is not None
+        except Exception:
+            logger.debug("decompose: plugin skill lookup failed", exc_info=True)
+            return False
+
+    try:
+        from tools.skills_tool import _find_all_skills
+
+        return any(item.get("name") == name for item in _find_all_skills())
+    except Exception:
+        logger.debug("decompose: local skill lookup failed", exc_info=True)
+        return False
+
+
+def _resolve_child_skills(
+    raw_skills: object,
+    *,
+    root_skills: Optional[list],
+    omitted: bool,
+) -> Optional[list[str]]:
+    """Validate one child skill set and return deterministic root-first order."""
+    root = [str(name).strip() for name in (root_skills or []) if str(name).strip()]
+    if omitted:
+        return root or (None if root_skills is None else [])
+    if not isinstance(raw_skills, list):
+        raise ValueError("must be a list of skill names")
+
+    explicit: list[str] = []
+    seen: set[str] = set()
+    for raw_name in raw_skills:
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("must contain only non-empty skill names")
+        name = raw_name.strip()
+        if name not in seen:
+            seen.add(name)
+            explicit.append(name)
+
+    missing_root = [name for name in root if name not in seen]
+    if missing_root:
+        raise ValueError(
+            "must include root skill(s): " + ", ".join(missing_root)
+        )
+
+    extras = [name for name in explicit if name not in set(root)]
+    unknown = [name for name in extras if not _is_installed_skill(name)]
+    if unknown:
+        raise ValueError("unknown skill(s): " + ", ".join(unknown))
+    return root + extras
 
 
 def _profile_author() -> str:
@@ -307,6 +371,7 @@ def decompose_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        root_skills=json.dumps(task.skills or [], ensure_ascii=False),
         roster=_format_roster(roster),
         default_assignee=default_assignee,
     )
@@ -422,12 +487,28 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
-        children.append({
+        skills_omitted = "skills" not in entry
+        try:
+            child_skills = _resolve_child_skills(
+                entry.get("skills"),
+                root_skills=task.skills,
+                omitted=skills_omitted,
+            )
+        except ValueError as exc:
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"tasks[{idx}].skills {exc}",
+            )
+        child_payload = {
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
-        })
+        }
+        if child_skills is not None or not skills_omitted:
+            child_payload["skills"] = child_skills
+        children.append(child_payload)
 
     try:
         with kb.connect_closing() as conn:

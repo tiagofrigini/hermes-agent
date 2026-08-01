@@ -75,6 +75,42 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _run_decompose(tid: str, payload: dict, *, installed_skills: set[str]):
+    patches = _patch_list_profiles(["orchestrator", "worker"])
+    patches.extend(
+        [
+            _patch_aux_client(jsonlib.dumps(payload)),
+            patch(
+                "hermes_cli.kanban_decompose._is_installed_skill",
+                side_effect=lambda name: name in installed_skills,
+            ),
+        ]
+    )
+    for item in patches:
+        item.start()
+    try:
+        return decomp.decompose_task(tid, author="orchestrator")
+    finally:
+        for item in reversed(patches):
+            item.stop()
+
+
+_OMIT = object()
+
+
+def _child_spec(*, skills: object = _OMIT):
+    child: dict[str, object] = {
+        "key": "impl",
+        "title": "Implement",
+        "body": "Do it",
+        "assignee": "worker",
+        "workspace_kind": "scratch",
+    }
+    if skills is not _OMIT:
+        child["skills"] = skills
+    return child
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -115,7 +151,12 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="route me safely", triage=True)
+        tid = kb.create_task(
+            conn,
+            title="route me safely",
+            triage=True,
+            skills=["root-skill"],
+        )
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -143,6 +184,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.assignee == "fallback"
+    assert task.skills == ["root-skill"]
 
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
@@ -161,3 +203,110 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_child_inherits_root_skills_when_omitted(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="root",
+            triage=True,
+            skills=["root-a", "root-b"],
+        )
+
+    outcome = _run_decompose(
+        tid,
+        {"fanout": True, "rationale": "split", "tasks": [_child_spec()]},
+        installed_skills={"root-a", "root-b"},
+    )
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids
+    with kb.connect_closing() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.skills == ["root-a", "root-b"]
+
+
+def test_decompose_child_explicit_skills_are_root_first_and_deduped(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="root", triage=True, skills=["root"])
+
+    outcome = _run_decompose(
+        tid,
+        {
+            "fanout": True,
+            "rationale": "split",
+            "tasks": [_child_spec(skills=["extra", "root", "extra"])],
+        },
+        installed_skills={"root", "extra"},
+    )
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids
+    with kb.connect_closing() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.skills == ["root", "extra"]
+
+
+@pytest.mark.parametrize(
+    ("child_skills", "installed_skills", "error_text"),
+    [
+        (["extra"], {"root", "extra"}, "must include root skill"),
+        (["root", "missing"], {"root"}, "unknown skill"),
+        ("root", {"root"}, "must be a list"),
+    ],
+)
+def test_decompose_rejects_invalid_child_skills_atomically(
+    kanban_home,
+    child_skills,
+    installed_skills,
+    error_text,
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="root", triage=True, skills=["root"])
+
+    outcome = _run_decompose(
+        tid,
+        {
+            "fanout": True,
+            "rationale": "split",
+            "tasks": [_child_spec(skills=child_skills)],
+        },
+        installed_skills=installed_skills,
+    )
+
+    assert outcome.ok is False
+    assert error_text in outcome.reason
+    with kb.connect_closing() as conn:
+        root = kb.get_task(conn, tid)
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id != ?", (tid,)
+        ).fetchone()[0]
+    assert root is not None
+    assert root.status == "triage"
+    assert child_count == 0
+
+
+def test_decompose_without_root_or_child_skills_preserves_none(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="root", triage=True)
+
+    outcome = _run_decompose(
+        tid,
+        {"fanout": True, "rationale": "split", "tasks": [_child_spec()]},
+        installed_skills=set(),
+    )
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids
+    with kb.connect_closing() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.skills is None
+
+
+def test_decompose_prompt_exposes_structured_child_skills():
+    prompt = decomp._SYSTEM_PROMPT
+    assert '\"skills\": [\"required-skill\", \"optional-extra-skill\"]' in prompt
+    assert "When omitted, inherit every skill required by the" in prompt
+    assert "root task" in prompt
