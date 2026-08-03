@@ -22,6 +22,7 @@ from collections import deque
 from pathlib import Path
 from typing import IO, Callable, Iterable, Protocol
 
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
@@ -409,7 +410,22 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    + "|".join((DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
+    + ")"
+)
+
+# Invocation-scoped lineage and ownership must not become reusable shell state.
+# Prefix families use bash name expansion; delegated/Kanban vars use exact names
+# so user-authored settings such as HERMES_KANBAN_HOME keep persisting.
+_SNAPSHOT_EXCLUDED_UNSET_NAMES = " ".join(
+    (
+        "${!HERMES_SESSION_*}",
+        "${!HERMES_CRON_AUTO_DELIVER_*}",
+        "HERMES_UI_SESSION_ID",
+        DELEGATED_CHILD_ENV_MARKER,
+        *KANBAN_ENV_KEYS,
+    )
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -452,8 +468,7 @@ def _export_dump_excluding_session_vars(
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"unset {_SNAPSHOT_EXCLUDED_UNSET_NAMES}{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -755,8 +770,21 @@ class BaseEnvironment(ABC):
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
         if self._snapshot_ready:
+            # An older snapshot may already contain a delegated-child marker.
+            # Preserve this invocation's authoritative process-env state across
+            # source(), then remove any stale value recovered from the snapshot.
+            marker = DELEGATED_CHILD_ENV_MARKER
+            parts.append(
+                f'if [ "${{{marker}+x}}" = x ]; then __hermes_dcc=${{{marker}}}; '
+                f"else __hermes_dcc=; fi"
+            )
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
+            )
+            parts.append(
+                f'unset {marker}; '
+                f'[ -n "$__hermes_dcc" ] && export {marker}="$__hermes_dcc"; '
+                f"unset __hermes_dcc"
             )
 
         for name, present, value in saved_names:
