@@ -1412,6 +1412,45 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     )
 
 
+def test_create_accepts_max_retries_override(worker_env):
+    """Routers can bound retries per task without changing board config."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    result = json.loads(kt._handle_create({
+        "title": "bounded executor",
+        "assignee": "worker-code",
+        "max_retries": 1,
+    }))
+
+    assert result["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.max_retries == 1
+
+
+@pytest.mark.parametrize("max_retries", [0, -1, "invalid", True])
+def test_create_rejects_invalid_max_retries(worker_env, max_retries):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "invalid retry bound",
+        "assignee": "worker-code",
+        "max_retries": max_retries,
+    }))
+
+    assert result["error"] == "max_retries must be a positive integer"
+
+
+def test_create_schema_exposes_max_retries():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert properties["max_retries"]["type"] == "integer"
+    assert properties["max_retries"]["minimum"] == 1
+
+
 def test_create_persists_explicit_worktree_branch(worker_env):
     """Router cards can pin the exact branch required by an approved plan."""
     from tools import kanban_tools as kt
