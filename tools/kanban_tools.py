@@ -1430,6 +1430,16 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    max_retries = args.get("max_retries")
+    if (
+        max_retries is not None
+        and (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 1
+        )
+    ):
+        return tool_error("max_retries must be a positive integer")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1486,6 +1496,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                max_retries=max_retries,
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -2417,6 +2428,15 @@ KANBAN_CREATE_SCHEMA = {
                     "Per-task runtime cap. When exceeded, the "
                     "dispatcher SIGTERMs the worker and re-queues the "
                     "task with outcome='timed_out'."
+                ),
+            },
+            "max_retries": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Per-task consecutive-failure circuit-breaker limit. "
+                    "For example, 1 blocks after the first failed run; omit "
+                    "to use the board-level kanban.failure_limit setting."
                 ),
             },
             "initial_status": {
