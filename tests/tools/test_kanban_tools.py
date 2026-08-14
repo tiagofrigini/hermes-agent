@@ -2080,6 +2080,37 @@ def test_task_scoped_cross_board_override_fails_before_db_connect(
     assert connect_mock.call_count == 0
 
 
+@pytest.mark.parametrize(
+    ("handler_name", "extra_args"),
+    [
+        ("_handle_request_review", {"summary": "ready for review"}),
+        ("_handle_request_changes", {"reason": "needs changes"}),
+    ],
+)
+def test_task_scoped_review_handlers_reject_cross_board_before_db_connect(
+    multi_board_env, monkeypatch, handler_name, extra_args
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", multi_board_env["default_seed"])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    connect_mock = Mock(side_effect=AssertionError("must reject before DB connect"))
+    monkeypatch.setattr(kt, "_connect", connect_mock)
+
+    result = json.loads(
+        getattr(kt, handler_name)(
+            {
+                "task_id": multi_board_env["default_seed"],
+                "board": "alt",
+                **extra_args,
+            }
+        )
+    )
+
+    assert "board" in result.get("error", "").lower()
+    assert connect_mock.call_count == 0
+
+
 def test_task_scoped_cross_board_attach_url_fails_before_network(
     multi_board_env, monkeypatch
 ):

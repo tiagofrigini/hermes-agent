@@ -1096,8 +1096,8 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
-    board = args.get("board")
     try:
+        board = _resolve_task_scoped_board(args.get("board"))
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
@@ -1154,8 +1154,8 @@ def _handle_request_changes(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
-    board = args.get("board")
     try:
+        board = _resolve_task_scoped_board(args.get("board"))
         kb, conn = _connect(board=board)
         try:
             ok, detail = kb.request_changes(
