@@ -11,6 +11,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
+import tools.environments.base_session_env as session_env
+
 from agent.delegation_context import (
     DELEGATED_CHILD_ENV_MARKER,
     KANBAN_ENV_KEYS,
@@ -158,5 +162,80 @@ def test_legacy_aux_export_cannot_remove_child_lineage_marker(tmp_path, monkeypa
             child = env.execute(_probe(_MARKER), timeout=15)
         assert child["returncode"] == 0
         assert "presence=set value=1" in child["output"]
+    finally:
+        env.cleanup()
+
+
+def test_marker_restore_uses_literal_python_value_with_shell_quoting():
+    """Marker restoration must not use a shell temporary that a snapshot can overwrite."""
+    marker_value = "child value 'quoted' $(not-executed)"
+    restore = session_env._marker_restore_script(marker_value)
+    assert "__hermes_dcc" not in restore
+    assert "__hermes_marker" not in restore
+
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'export {_MARKER}=legacy; {restore}; printf "%s" "${{{_MARKER}-unset}}"',
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout == marker_value
+
+
+def test_user_exports_functions_and_cwd_persist_across_execute(tmp_path, monkeypatch):
+    """The session contract keeps ordinary env, functions, and CWD between commands."""
+    monkeypatch.delenv(_MARKER, raising=False)
+    (tmp_path / "sub").mkdir()
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        assert env.execute("export MYVAR=keep", timeout=15)["returncode"] == 0
+        read_export = env.execute("printf 'MYVAR=%s\\n' \"${MYVAR-unset}\"", timeout=15)
+        assert read_export["returncode"] == 0
+        assert read_export["output"] == "MYVAR=keep\n"
+
+        assert env.execute("myfunc() { printf 'FUNC=keep\\n'; }", timeout=15)["returncode"] == 0
+        call_function = env.execute("myfunc", timeout=15)
+        assert call_function["returncode"] == 0
+        assert call_function["output"] == "FUNC=keep\n"
+
+        assert env.execute("cd sub", timeout=15)["returncode"] == 0
+        read_cwd = env.execute("pwd -P", timeout=15)
+        assert read_cwd["returncode"] == 0
+        assert read_cwd["output"] == f"{tmp_path / 'sub'}\n"
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize(
+    "legacy_line",
+    [
+        f"export {_MARKER}=1",
+        f'declare -x {_MARKER}="1"',
+        "export __hermes_dcc=legacy-internal",
+        'declare -x __hermes_dcc="legacy-internal"',
+    ],
+)
+@pytest.mark.parametrize("child", [False, True])
+def test_legacy_marker_and_aux_declarations_cannot_change_parent_child_lineage(
+    tmp_path, monkeypatch, legacy_line, child
+):
+    """Both legacy declaration forms are scrubbed without erasing a real child marker."""
+    monkeypatch.delenv(_MARKER, raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        snapshot = Path(env._snapshot_path)
+        snapshot.write_text(snapshot.read_text(encoding="utf-8") + f"\n{legacy_line}\n", encoding="utf-8")
+        if child:
+            with delegated_child_context():
+                result = env.execute(_probe(_MARKER), timeout=15)
+        else:
+            result = env.execute(_probe(_MARKER), timeout=15)
+        assert result["returncode"] == 0
+        expected = "presence=set value=1" if child else "presence= value=unset"
+        assert expected in result["output"]
     finally:
         env.cleanup()

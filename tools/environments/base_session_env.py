@@ -99,8 +99,7 @@ def _snapshot_bootstrap_script(
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
         f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
-        "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
-        f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
+        f"{_function_dump_script(_SNAP_TMP)}\n"
         f"alias -p >> {_SNAP_TMP}\n"
         f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
         f"echo 'set +e' >> {_SNAP_TMP}\n"
@@ -109,6 +108,27 @@ def _snapshot_bootstrap_script(
         f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
         f"builtin cd -- {quoted_cwd} 2>/dev/null || true\n"
         f"{_cwd_marker_printf(cwd_marker)}\n")
+
+
+def _marker_restore_script(marker_value: str | None) -> str:
+    """Restore the invocation marker after a legacy snapshot is sourced globally.
+
+    The value is computed by Python from the effective invocation environment; embedding it
+    literally avoids a shell temporary that snapshot code could overwrite. Empty/absent values
+    are represented by an unset marker, which is the parent state.
+    """
+    marker = DELEGATED_CHILD_ENV_MARKER
+    if not marker_value:
+        return f"unset {marker}"
+    return f"unset {marker}; export {marker}={shlex.quote(marker_value)}"
+
+
+def _function_dump_script(tmp_path: str) -> str:
+    """Append user-defined functions to a snapshot, excluding private wrapper helpers."""
+    return (
+        "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true; "
+        f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {tmp_path} 2>/dev/null || true"
+    )
 
 
 def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -129,7 +149,8 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
+    marker_value: str | None = None) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
@@ -144,17 +165,11 @@ def _wrap_command_script(
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:
-        # Source legacy snapshots in a function-local marker scope. The marker is
-        # derived from the shell invocation environment; snapshot assignments then
-        # cannot change the parent/child lineage seen after the source returns.
-        marker = DELEGATED_CHILD_ENV_MARKER
+        # Source legacy snapshots in the caller's global scope, then restore the marker from
+        # Python's invocation environment. Snapshot assignments cannot change that literal value.
         parts += [
-            f"__hermes_source_snapshot() {{",
-            f'    local {marker}="${{{marker}-}}"',
-            f"    source {quoted_snap} >/dev/null 2>&1 || true",
-            "}",
-            "__hermes_source_snapshot",
-            "unset -f __hermes_source_snapshot",
+            f"source {quoted_snap} >/dev/null 2>&1 || true",
+            _marker_restore_script(marker_value),
         ]
     parts += restore
     parts += [
@@ -168,8 +183,9 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
-            f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
+            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)}; "
+            f"{_function_dump_script(_SNAP_TMP)}; "
+            f"mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
     return "\n".join(parts)

@@ -159,3 +159,29 @@ Nenhuma aplicação live, restart, update, deploy, limpeza de snapshot operacion
 ### Limitação para re-review
 
 A evidência local cobre os dois snapshots legados concretos e a matriz Linux; os testes macOS/Windows permanecem dependentes das lanes de plataforma. A suíte completa não foi executada, conforme o escopo.
+
+## Lane corretiva bounded — reprodução e limite
+
+**Data da evidência:** 2026-09-09 (America/Sao_Paulo)
+**Escopo:** somente persistência do snapshot e restauração literal do marker; sem runtime live, reset de gateway, perfis, config, cron, snapshot operacional ou Kanban.
+
+Probe real (`LocalEnvironment`, bash e snapshot temporário) executado no candidato `f33189f4c8`:
+
+- `export MYVAR=keep` → nova execução: `MYVAR=keep` (export persiste neste candidato).
+- definição `myfunc() { printf ...; }` → nova execução: `127`, `myfunc: command not found`.
+- `cd sub` → `pwd -P`: CWD persiste.
+- parent: marker ausente; child em `delegated_child_context()`: `presence=set value=1`.
+
+O mesmo probe na base original `6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef` reproduziu o mesmo resultado de function (`127`) e os mesmos resultados de export/CWD/marker. Portanto, a perda de function definida por comando é preexistente à microcorreção B1; não será atribuída falsamente ao `source` dentro de função. O contrato coberto nesta lane continua exigindo que a correção não perca estado de env/CWD e que novos testes distingam essa limitação histórica.
+
+A implementação corretiva será feita após testes RED, removendo `source` dentro de função e usando restauração literal do marker calculada no Python a partir do ambiente/contexto efetivo da invocação.
+
+## Correção da âncora de reprodução
+
+A primeira execução ad-hoc sem isolamento de importação não é evidência da lane: o processo resolveu módulos do checkout live por `PYTHONPATH` herdado. Ela é descartada. A reprodução canônica foi repetida em worktrees temporários, com `sys.path` explicitamente apontando para cada árvore, sem mutação live:
+
+- `f33189f4c8` antes da correção: export → `MYVAR=unset`, function → `127`, CWD persistente, parent sem marker e child `value=1`.
+- base original `6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef`: export → `MYVAR=keep`, function → `127`, CWD persistente, parent sem marker e child `value=1`.
+- worktree corretivo após a implementação: export → `MYVAR=keep`, function → `FUNC=keep`, CWD persistente, parent sem marker e child `value=1`.
+
+A function definida por comando era preexistente na base; a regressão introduzida por `source` dentro da função era a perda do export no candidato `f33189f4c8`. A lane corrige ambos os contratos explicitamente solicitados, sem atribuir causalidade incorreta à base.
