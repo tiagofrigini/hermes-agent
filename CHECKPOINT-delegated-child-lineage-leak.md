@@ -185,3 +185,13 @@ A primeira execução ad-hoc sem isolamento de importação não é evidência d
 - worktree corretivo após a implementação: export → `MYVAR=keep`, function → `FUNC=keep`, CWD persistente, parent sem marker e child `value=1`.
 
 A function definida por comando era preexistente na base; a regressão introduzida por `source` dentro da função era a perda do export no candidato `f33189f4c8`. A lane corrige ambos os contratos explicitamente solicitados, sem atribuir causalidade incorreta à base.
+
+## Fechamento da lane corretiva
+
+- Commit: `9b7c548b73f458b93d8e84378c5c7f0e8af1c10b`.
+- Runner oficial focalizado: `tests/tools/test_local_env_delegation_marker_snapshot.py` — **16 passados, 0 falhas**.
+- Runner oficial pertinente (9 arquivos, incluindo passthrough, blocklist, Kanban, session-context e snapshots) — **166 passados, 0 falhas, 3 skips de plataforma**, uma única execução do comando agrupado.
+- `python3 -m py_compile tools/environments/base.py tools/environments/base_session_env.py tests/tools/test_local_env_delegation_marker_snapshot.py` — passou.
+- `git diff --check` — passou antes do commit e na âncora final.
+- Push verificado: `fork/fix/delegated-child-lineage-snapshot` aponta para `9b7c548b73f458b93d8e84378c5c7f0e8af1c10b`.
+- Nenhuma aplicação live, restart, update, deploy, limpeza de marker/snapshot operacional, alteração de perfil/config/cron ou Kanban foi feita.
