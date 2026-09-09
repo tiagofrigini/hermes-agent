@@ -9,6 +9,8 @@ import re
 import shlex
 from typing import Iterable
 
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
 # Bridged per-session vars (gateway.session_context._VAR_MAP) are injected fresh onto every
 # command's process env and must NEVER persist in the shared bash snapshot: one long-lived
 # backend serves many sessions, so a snapshot carrying the FIRST session's HERMES_SESSION_ID
@@ -28,7 +30,14 @@ from typing import Iterable
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|"
+    + "|".join((DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
+    + ")")
+_SNAPSHOT_EXCLUDED_UNSET_NAMES = (
+    "${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+    "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID "
+    + " ".join((DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
+)
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -66,13 +75,11 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
     return (
-        "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "${!HERMES_BROWSER_CONTROL_*} "
-        # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
-        # by every wrapper with ${VAR:-default} semantics; persisting them would
-        # let the FIRST command's value override a later outer-harness value.
-        "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        "{ ( unset "
+        f"{_SNAPSHOT_EXCLUDED_UNSET_NAMES} "
+        # Caller names are quoted so malformed config can never become shell syntax
+        # (valid names stay unquoted by shlex.quote()).
+        f"{extra_unset.lstrip()} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
 
@@ -137,7 +144,20 @@ def _wrap_command_script(
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:
+        # A legacy snapshot may already contain the delegated marker. Preserve the
+        # authoritative process-env value across sourcing so a parent cannot inherit
+        # stale lineage while a genuine child keeps its marker.
+        marker = DELEGATED_CHILD_ENV_MARKER
+        parts.append(
+            f'if [ "${{{marker}+x}}" = x ]; then __hermes_dcc=${{{marker}}}; '
+            f"else __hermes_dcc=; fi"
+        )
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
+        parts.append(
+            f'unset {marker}; '
+            f'[ -n "$__hermes_dcc" ] && export {marker}="$__hermes_dcc"; '
+            "unset __hermes_dcc"
+        )
     parts += restore
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
