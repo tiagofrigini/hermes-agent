@@ -121,3 +121,42 @@ def test_export_filter_removes_lineage_and_ownership_but_keeps_user_exports(monk
     assert 'declare -x PATH="/usr/bin"' in out
     assert 'declare -x HERMES_HOME="/home/u/.hermes"' in out
     assert 'declare -x MYVAR="keep"' in out
+
+
+def test_legacy_aux_export_cannot_create_parent_lineage_marker(tmp_path, monkeypatch):
+    """A legacy auxiliary export cannot turn an ordinary parent into a child."""
+    monkeypatch.delenv(_MARKER, raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        snapshot = Path(env._snapshot_path)
+        snapshot.write_text(
+            snapshot.read_text(encoding="utf-8")
+            + "\nexport __hermes_dcc=legacy-internal\n",
+            encoding="utf-8",
+        )
+
+        parent = env.execute(_probe(_MARKER), timeout=15)
+        assert parent["returncode"] == 0
+        assert "presence= value=unset" in parent["output"]
+    finally:
+        env.cleanup()
+
+
+def test_legacy_aux_export_cannot_remove_child_lineage_marker(tmp_path, monkeypatch):
+    """A legacy empty auxiliary export cannot erase a real child marker."""
+    monkeypatch.delenv(_MARKER, raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        snapshot = Path(env._snapshot_path)
+        snapshot.write_text(
+            snapshot.read_text(encoding="utf-8")
+            + "\nexport __hermes_dcc=\n",
+            encoding="utf-8",
+        )
+
+        with delegated_child_context():
+            child = env.execute(_probe(_MARKER), timeout=15)
+        assert child["returncode"] == 0
+        assert "presence=set value=1" in child["output"]
+    finally:
+        env.cleanup()

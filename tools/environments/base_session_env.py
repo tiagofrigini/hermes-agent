@@ -144,20 +144,18 @@ def _wrap_command_script(
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:
-        # A legacy snapshot may already contain the delegated marker. Preserve the
-        # authoritative process-env value across sourcing so a parent cannot inherit
-        # stale lineage while a genuine child keeps its marker.
+        # Source legacy snapshots in a function-local marker scope. The marker is
+        # derived from the shell invocation environment; snapshot assignments then
+        # cannot change the parent/child lineage seen after the source returns.
         marker = DELEGATED_CHILD_ENV_MARKER
-        parts.append(
-            f'if [ "${{{marker}+x}}" = x ]; then __hermes_dcc=${{{marker}}}; '
-            f"else __hermes_dcc=; fi"
-        )
-        parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
-        parts.append(
-            f'unset {marker}; '
-            f'[ -n "$__hermes_dcc" ] && export {marker}="$__hermes_dcc"; '
-            "unset __hermes_dcc"
-        )
+        parts += [
+            f"__hermes_source_snapshot() {{",
+            f'    local {marker}="${{{marker}-}}"',
+            f"    source {quoted_snap} >/dev/null 2>&1 || true",
+            "}",
+            "__hermes_source_snapshot",
+            "unset -f __hermes_source_snapshot",
+        ]
     parts += restore
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',

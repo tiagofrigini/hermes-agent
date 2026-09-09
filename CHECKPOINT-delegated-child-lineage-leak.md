@@ -121,3 +121,41 @@ git status --short --branch
 4. Após o runtime novo, fazer probe read-only do processo gateway/root e do snapshot criado por um comando parent; confirmar gateway/root e snapshot sem marker.
 5. Executar uma operação child controlada para confirmar marker presente no subprocesso child e ausente no snapshot/parent; revalidar os guards CLI/tool/DB.
 6. Não remover manualmente snapshots legados nem contornar guards; a neutralização ocorre pelo wrapper corrigido no próximo uso.
+
+## Follow-up B1 — correção aplicada
+
+**Data da evidência:** 2026-09-09T13:20:48-03:00 (America/Sao_Paulo)
+**Escopo:** somente a colisão do auxiliar `__hermes_dcc` com `source` de snapshot legado; nenhum reset de gateway/contexto foi adicionado.
+
+### Causa confirmada
+
+O wrapper anterior copiava o marker de invocação para `__hermes_dcc` no mesmo escopo shell em que o snapshot era sourced. Assim, `export __hermes_dcc=legacy-internal` substituía a cópia antes da restauração, e `export __hermes_dcc=` apagava a cópia de um child. A cópia não era derivada novamente do contexto de invocação.
+
+### Solução mínima
+
+`tools/environments/base_session_env.py` agora sources o snapshot dentro de uma função com variável local `HERMES_DELEGATED_CHILD_CONTEXT`, inicializada a partir do ambiente da invocação. A atribuição legítima do snapshot fica confinada ao escopo local; ao retornar, o marker global original do parent/child permanece intacto. O auxiliar `__hermes_dcc` foi removido; não há nome alternativo ou aleatorização, e os guards CLI/tool/DB e a injeção legítima do child não foram alterados.
+
+### TDD e verificação
+
+- **RED formal antes da produção:**
+  `env -u HERMES_DELEGATED_CHILD_CONTEXT scripts/run_tests.sh tests/tools/test_local_env_delegation_marker_snapshot.py -k 'legacy_aux_export' -v`
+  — **2 falharam**, ambos por `AssertionError` real: parent recebeu `legacy-internal`; child perdeu o marker (`presence= value=unset`).
+- **GREEN focalizado após a correção:** o mesmo comando — **2 passaram, 0 falharam**.
+- **Runner oficial solicitado:**
+  `env -u HERMES_DELEGATED_CHILD_CONTEXT scripts/run_tests.sh` com os 9 arquivos de regressão, matriz, passthrough e blocklist — **156 passaram, 0 falharam, 3 skips de plataforma**, em 19,4 s.
+  - Inclui `test_local_env_delegation_marker_snapshot.py` com **6/6**.
+  - Os 3 skips são os casos macOS/Windows esperados neste host Linux.
+- `python3 -m py_compile tools/environments/base_session_env.py tests/tools/test_local_env_delegation_marker_snapshot.py` — passou.
+- `git diff --check` — passou.
+
+### Arquivos alterados neste follow-up
+
+- `tools/environments/base_session_env.py`
+- `tests/tools/test_local_env_delegation_marker_snapshot.py`
+- `CHECKPOINT-delegated-child-lineage-leak.md` (append-only)
+
+Nenhuma aplicação live, restart, update, deploy, limpeza de snapshot operacional, mutação Kanban, alteração de perfil/config/cron ou contorno de guard foi executado.
+
+### Limitação para re-review
+
+A evidência local cobre os dois snapshots legados concretos e a matriz Linux; os testes macOS/Windows permanecem dependentes das lanes de plataforma. A suíte completa não foi executada, conforme o escopo.
