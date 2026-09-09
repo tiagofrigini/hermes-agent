@@ -10,6 +10,8 @@
 - Worktree de correção: `/home/tiago/hermes-agent-delegated-lineage-fix`
 - Branch: `fix/delegated-child-lineage-snapshot`
 - Base/HEAD inicial do worktree: `6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef`
+- Commit da correção: `af8232d838` (`Fix delegated child marker snapshot leakage`)
+- Branch publicado no fork seguro: `fork/fix/delegated-child-lineage-snapshot`
 - O checkout live não foi alterado. Não houve restart/update, limpeza de snapshot operacional, mutação de Kanban, SQL/wrapper de contorno, alteração de perfil/config/cron ou acesso ao lote clínico.
 
 ## Evidência live read-only
