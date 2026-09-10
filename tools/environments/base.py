@@ -320,10 +320,20 @@ class BaseEnvironment(ABC):
         rewrite native/mixed Windows paths to ``/c/...``; remote backends are POSIX."""
         return shlex.quote(path)
 
+    def _delegated_child_marker_value(self) -> str | None:
+        """Resolve the marker exactly as the local child-env builder will for this invocation."""
+        from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env
+        effective = dict(os.environ)
+        effective.update(self.env)
+        effective = delegated_child_subprocess_env(effective) or effective
+        value = effective.get(DELEGATED_CHILD_ENV_MARKER)
+        return value if isinstance(value, str) and value else None
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         return _wrap_command_script(
             command,
+            marker_value=self._delegated_child_marker_value(),
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
             **self._snapshot_script_kwargs(cwd))

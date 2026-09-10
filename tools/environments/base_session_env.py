@@ -9,6 +9,8 @@ import re
 import shlex
 from typing import Iterable
 
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
 # Bridged per-session vars (gateway.session_context._VAR_MAP) are injected fresh onto every
 # command's process env and must NEVER persist in the shared bash snapshot: one long-lived
 # backend serves many sessions, so a snapshot carrying the FIRST session's HERMES_SESSION_ID
@@ -28,7 +30,14 @@ from typing import Iterable
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|"
+    + "|".join((DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
+    + ")")
+_SNAPSHOT_EXCLUDED_UNSET_NAMES = (
+    "${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+    "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID "
+    + " ".join((DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS))
+)
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -66,13 +75,11 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
     return (
-        "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "${!HERMES_BROWSER_CONTROL_*} "
-        # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
-        # by every wrapper with ${VAR:-default} semantics; persisting them would
-        # let the FIRST command's value override a later outer-harness value.
-        "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        "{ ( unset "
+        f"{_SNAPSHOT_EXCLUDED_UNSET_NAMES} "
+        # Caller names are quoted so malformed config can never become shell syntax
+        # (valid names stay unquoted by shlex.quote()).
+        f"{extra_unset.lstrip()} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
 
@@ -92,8 +99,7 @@ def _snapshot_bootstrap_script(
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
         f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
-        "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
-        f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
+        f"{_function_dump_script(_SNAP_TMP)}\n"
         f"alias -p >> {_SNAP_TMP}\n"
         f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
         f"echo 'set +e' >> {_SNAP_TMP}\n"
@@ -102,6 +108,27 @@ def _snapshot_bootstrap_script(
         f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
         f"builtin cd -- {quoted_cwd} 2>/dev/null || true\n"
         f"{_cwd_marker_printf(cwd_marker)}\n")
+
+
+def _marker_restore_script(marker_value: str | None) -> str:
+    """Restore the invocation marker after a legacy snapshot is sourced globally.
+
+    The value is computed by Python from the effective invocation environment; embedding it
+    literally avoids a shell temporary that snapshot code could overwrite. Empty/absent values
+    are represented by an unset marker, which is the parent state.
+    """
+    marker = DELEGATED_CHILD_ENV_MARKER
+    if not marker_value:
+        return f"unset {marker}"
+    return f"unset {marker}; export {marker}={shlex.quote(marker_value)}"
+
+
+def _function_dump_script(tmp_path: str) -> str:
+    """Append user-defined functions to a snapshot, excluding private wrapper helpers."""
+    return (
+        "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true; "
+        f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {tmp_path} 2>/dev/null || true"
+    )
 
 
 def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -122,7 +149,8 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
+    marker_value: str | None = None) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
@@ -137,7 +165,12 @@ def _wrap_command_script(
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:
-        parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
+        # Source legacy snapshots in the caller's global scope, then restore the marker from
+        # Python's invocation environment. Snapshot assignments cannot change that literal value.
+        parts += [
+            f"source {quoted_snap} >/dev/null 2>&1 || true",
+            _marker_restore_script(marker_value),
+        ]
     parts += restore
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
@@ -150,8 +183,9 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
-            f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
+            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)}; "
+            f"{_function_dump_script(_SNAP_TMP)}; "
+            f"mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
     return "\n".join(parts)
